@@ -1,0 +1,101 @@
+name: CI AWS
+
+# Same pipeline as ci.yml, with three changes:
+#   1. runs on our own EC2 runner instead of GitHub's
+#   2. pushes to ECR instead of Docker Hub
+#   3. deploys the container to the prod EC2 and checks it there
+on:
+  push:
+    branches: [ AWS-Infrastructure ]
+
+permissions:
+  contents: write
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REPO: simple-java-maven-app
+  PROD_INSTANCE_ID: i-0b5dd06f3f65baf48
+
+jobs:
+  build:
+    # The 'aws' label was given to the runner with ./config.sh --labels aws
+    runs-on: [ self-hosted, aws ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Test
+        run: mvn -B clean verify
+
+      # Identical to ci.yml.
+      - name: Bump patch version
+        run: |
+          current=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)
+          [[ "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            && VERSION="${current%.*}.$(( ${current##*.} + 1 ))" \
+            || VERSION="1.0.0"
+          mvn -B -q versions:set -DnewVersion=$VERSION -DgenerateBackupPoms=false
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      # No secrets here. The EC2 instance profile gives us ECR access.
+      - name: Build & push to ECR
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          REGISTRY=$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com
+          IMAGE=$REGISTRY/$ECR_REPO
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+          echo "REGISTRY=$REGISTRY" >> $GITHUB_ENV
+
+          aws ecr get-login-password --region $AWS_REGION \
+            | docker login --username AWS --password-stdin $REGISTRY
+          docker build -t $IMAGE:$VERSION -t $IMAGE:latest .
+          docker push -a $IMAGE
+          docker image prune -f   # keep the runner disk from filling up
+
+      # Deploy to the prod server with SSM RunCommand, like the weather Jenkinsfile.
+      # send-command returns at once, so 'wait' is what makes a broken deploy fail.
+      - name: Deploy to prod & verify
+        run: |
+          cat > /tmp/deploy.json <<EOF
+          {"commands":[
+            "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REGISTRY",
+            "docker pull $IMAGE:$VERSION",
+            "docker run --rm $IMAGE:$VERSION",
+            "docker image prune -f"
+          ]}
+          EOF
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids $PROD_INSTANCE_ID \
+            --document-name AWS-RunShellScript \
+            --comment "deploy $VERSION" \
+            --parameters file:///tmp/deploy.json \
+            --query Command.CommandId --output text)
+
+          aws ssm wait command-executed \
+            --command-id $CMD_ID --instance-id $PROD_INSTANCE_ID || true
+
+          get () { aws ssm get-command-invocation --command-id $CMD_ID \
+                     --instance-id $PROD_INSTANCE_ID --query $1 --output text; }
+
+          get StandardOutputContent | tee deploy.log
+          get StandardErrorContent
+          STATUS=$(get Status)
+          echo "prod status: $STATUS"
+
+          [ "$STATUS" = "Success" ] || exit 1
+          grep -q "Hello World!" deploy.log
+
+      # Identical to ci.yml, except it pushes to this branch.
+      - name: Commit version bump
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git commit -am "ci: release $VERSION [skip ci]"
+          git tag -a aws-v$VERSION -m "AWS release $VERSION"
+          git push origin HEAD:${{ github.ref_name }} --follow-tags

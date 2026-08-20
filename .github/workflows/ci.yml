@@ -39,6 +39,17 @@ jobs:
           docker build -t $IMAGE:$VERSION -t $IMAGE:latest .
           docker push -a $IMAGE
 
+      # Pull from Docker Hub (not the local build cache) so this tests the
+      # published image. The app prints one line and exits, so "running" means
+      # correct stdout and exit code 0.
+      - name: Verify published image
+        run: |
+          IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/simple-java-maven-app
+          docker image rm -f $IMAGE:$VERSION $IMAGE:latest
+          docker pull $IMAGE:$VERSION
+          docker run --rm $IMAGE:$VERSION | tee out.log
+          grep -q "Hello World!" out.log
+
       - name: Commit version bump
         run: |
           git config user.name github-actions
